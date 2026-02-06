@@ -223,7 +223,7 @@ def generate_csv(
     scene_count: int,
     background: Optional[str],
     out_path: Optional[str],
-) -> Tuple[str, str, List[str]]:
+) -> Tuple[str, str, str, List[str]]:
     film_guide = None
     scene_guide = None
     if film_preset_key and film_preset_key in FILM_TYPE_GUIDES:
@@ -260,7 +260,7 @@ def generate_csv(
     write_csv(resolved_out_path, scenes)
 
     title = extract_story_title(story) or topic
-    return resolved_out_path, title, warnings
+    return resolved_out_path, title, story, warnings
 
 
 def generate_scenes_json(
@@ -502,7 +502,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         print("\n=== 生成中 ===")
-        out_path, story_title, warnings = generate_csv(
+        out_path, story_title, _story, warnings = generate_csv(
             topic=topic,
             model=args.model,
             base_url=args.base_url,

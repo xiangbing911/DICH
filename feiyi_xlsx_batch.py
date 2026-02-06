@@ -52,15 +52,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="数据起始行（默认 2，跳过表头）",
     )
     p.add_argument(
-        "--write-title-col",
+        "--write-story-col",
         type=int,
-        default=4,
-        help="将生成的故事标题写入第几列（默认 4）",
+        default=5,
+        help="将故事内容写入第几列（默认 5）",
     )
     p.add_argument(
-        "--write-title-header",
-        default="生成故事标题",
-        help="表头名称（默认：生成故事标题）",
+        "--write-story-header",
+        default="生成故事",
+        help="表头名称（默认：生成故事）",
     )
     p.add_argument(
         "--no-backup",
@@ -86,6 +86,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=None,
         help="场景数量（可选；不填则用 qwen_feiyi_to_csv.py 默认值）",
     )
+    p.add_argument(
+        "--scene-count-col",
+        type=int,
+        default=4,
+        help="场景数量所在列（默认 4）",
+    )
     args = p.parse_args(argv)
 
     try:
@@ -110,17 +116,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     os.makedirs(args.out_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    if args.start_row >= 2 and args.write_title_col >= 1:
-        header_cell = ws.cell(row=1, column=args.write_title_col)
+    if args.start_row >= 2 and args.write_story_col >= 1:
+        header_cell = ws.cell(row=1, column=args.write_story_col)
         if not str(header_cell.value or "").strip():
-            header_cell.value = args.write_title_header
+            header_cell.value = args.write_story_header
 
     processed = 0
+    file_seq = 0
     failed = 0
     for row_idx in range(args.start_row, ws.max_row + 1):
         name = ws.cell(row=row_idx, column=1).value
         film_type_cell = ws.cell(row=row_idx, column=2).value
         background = ws.cell(row=row_idx, column=3).value
+        scene_count_cell = (
+            ws.cell(row=row_idx, column=args.scene_count_col).value
+            if args.scene_count_col >= 1
+            else None
+        )
 
         topic = str(name or "").strip()
         if not topic:
@@ -131,8 +143,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         background_text = str(background or "").strip() or None
 
+        file_seq += 1
         safe_topic = _safe_name(topic)
-        out_path = os.path.join(args.out_dir, f"{row_idx:04d}_{safe_topic}_{ts}.csv")
+        out_path = os.path.join(args.out_dir, f"{file_seq:04d}_{safe_topic}_{ts}.csv")
 
         gen_args: list[str] = [
             "--topic",
@@ -148,7 +161,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             gen_args += ["--api-key", args.api_key]
         if args.no_stream:
             gen_args += ["--no-stream"]
-        if args.scene_count is not None:
+        row_scene_count = None
+        if scene_count_cell is not None:
+            try:
+                row_scene_count = int(str(scene_count_cell).strip())
+            except Exception:
+                row_scene_count = None
+        if row_scene_count and row_scene_count > 0:
+            gen_args += ["--scene-count", str(int(row_scene_count))]
+        elif args.scene_count is not None:
             gen_args += ["--scene-count", str(int(args.scene_count))]
         if film_type_key:
             gen_args += ["--film-type", film_type_key]
@@ -162,12 +183,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             film_type, film_preset_key = gen.resolve_film_type(
                 film_type_preset=film_type_key, film_type_custom=film_type_custom
             )
-            scene_count = (
-                int(args.scene_count)
-                if args.scene_count is not None
-                else gen.DEFAULT_SCENE_COUNT
-            )
-            out_csv, story_title, _warnings = gen.generate_csv(
+            if row_scene_count and row_scene_count > 0:
+                scene_count = int(row_scene_count)
+            elif args.scene_count is not None:
+                scene_count = int(args.scene_count)
+            else:
+                scene_count = gen.DEFAULT_SCENE_COUNT
+            out_csv, story_title, story_content, _warnings = gen.generate_csv(
                 topic=topic,
                 model=args.model,
                 base_url=args.base_url,
@@ -179,7 +201,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 background=background_text,
                 out_path=out_path,
             )
-            ws.cell(row=row_idx, column=args.write_title_col).value = story_title
+            story_content_clean = (story_content or "").replace("**", "")
+            ws.cell(row=row_idx, column=args.write_story_col).value = story_content_clean
             processed += 1
             print(f"Saved CSV: {out_csv}")
             print(f"Story title: {story_title}")
