@@ -36,36 +36,15 @@ def _resolve_film_type_args(
 
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="Read 非遗项目汇总.xlsx (项目名称/短片类型/背景资料) and call qwen_feiyi_to_csv.py per row."
+        description="Read 非遗项目汇总.xlsx (项目名称/短片类型/背景资料) and generate one CSV per row."
     )
     p.add_argument("--xlsx", default="非遗项目汇总.xlsx", help="输入 XLSX 路径")
-    p.add_argument(
-        "--xlsx-out",
-        default=None,
-        help="输出 XLSX 路径（可选；默认覆盖输入文件）",
-    )
     p.add_argument("--sheet", default=None, help="Sheet 名称（默认第一个）")
     p.add_argument(
         "--start-row",
         type=int,
         default=2,
         help="数据起始行（默认 2，跳过表头）",
-    )
-    p.add_argument(
-        "--write-story-col",
-        type=int,
-        default=5,
-        help="将故事内容写入第几列（默认 5）",
-    )
-    p.add_argument(
-        "--write-story-header",
-        default="生成故事",
-        help="表头名称（默认：生成故事）",
-    )
-    p.add_argument(
-        "--no-backup",
-        action="store_true",
-        help="不创建备份文件（默认会在同目录创建 .bak_<timestamp>.xlsx）",
     )
     p.add_argument(
         "--out-dir",
@@ -84,13 +63,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--scene-count",
         type=int,
         default=None,
-        help="场景数量（可选；不填则用 qwen_feiyi_to_csv.py 默认值）",
+        help="场景数量（可选；开启自动规划时仅作为兜底）",
     )
     p.add_argument(
         "--scene-count-col",
         type=int,
         default=4,
         help="场景数量所在列（默认 4）",
+    )
+    p.add_argument(
+        "--auto-plan",
+        action="store_true",
+        default=True,
+        help="由模型自动决定短片类型与场景数量（默认开启）",
+    )
+    p.add_argument(
+        "--no-auto-plan",
+        action="store_false",
+        dest="auto_plan",
+        help="关闭自动规划，按表格/参数指定短片类型与场景数",
     )
     args = p.parse_args(argv)
 
@@ -110,16 +101,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"XLSX not found: {args.xlsx}", file=sys.stderr)
         return 2
 
-    wb = openpyxl.load_workbook(args.xlsx, read_only=False, data_only=True)
+    wb = openpyxl.load_workbook(args.xlsx, read_only=True, data_only=True)
     ws = wb[args.sheet] if args.sheet else wb.worksheets[0]
 
     os.makedirs(args.out_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    if args.start_row >= 2 and args.write_story_col >= 1:
-        header_cell = ws.cell(row=1, column=args.write_story_col)
-        if not str(header_cell.value or "").strip():
-            header_cell.value = args.write_story_header
 
     processed = 0
     file_seq = 0
@@ -141,55 +127,36 @@ def main(argv: Optional[list[str]] = None) -> int:
         film_type_key, film_type_custom = _resolve_film_type_args(
             film_type_cell=str(film_type_cell or "")
         )
+        if args.auto_plan:
+            film_type_key, film_type_custom = None, None
         background_text = str(background or "").strip() or None
 
         file_seq += 1
         safe_topic = _safe_name(topic)
         out_path = os.path.join(args.out_dir, f"{file_seq:04d}_{safe_topic}_{ts}.csv")
 
-        gen_args: list[str] = [
-            "--topic",
-            topic,
-            "--out",
-            out_path,
-            "--model",
-            args.model,
-            "--base-url",
-            args.base_url,
-        ]
-        if args.api_key:
-            gen_args += ["--api-key", args.api_key]
-        if args.no_stream:
-            gen_args += ["--no-stream"]
         row_scene_count = None
         if scene_count_cell is not None:
             try:
                 row_scene_count = int(str(scene_count_cell).strip())
             except Exception:
                 row_scene_count = None
-        if row_scene_count and row_scene_count > 0:
-            gen_args += ["--scene-count", str(int(row_scene_count))]
-        elif args.scene_count is not None:
-            gen_args += ["--scene-count", str(int(args.scene_count))]
-        if film_type_key:
-            gen_args += ["--film-type", film_type_key]
-        if film_type_custom:
-            gen_args += ["--film-type-custom", film_type_custom]
-        if background_text:
-            gen_args += ["--background", background_text]
 
         print(f"\n=== Row {row_idx}: {topic} / {film_type_custom or film_type_key or ''} ===")
         try:
-            film_type, film_preset_key = gen.resolve_film_type(
-                film_type_preset=film_type_key, film_type_custom=film_type_custom
-            )
+            film_type: Optional[str] = None
+            film_preset_key: Optional[str] = None
+            if not args.auto_plan:
+                film_type, film_preset_key = gen.resolve_film_type(
+                    film_type_preset=film_type_key, film_type_custom=film_type_custom
+                )
             if row_scene_count and row_scene_count > 0:
                 scene_count = int(row_scene_count)
             elif args.scene_count is not None:
                 scene_count = int(args.scene_count)
             else:
-                scene_count = gen.DEFAULT_SCENE_COUNT
-            out_csv, story_title, story_content, _warnings = gen.generate_csv(
+                scene_count = None
+            out_csv, story_title, _story_content, _warnings, decision = gen.generate_csv(
                 topic=topic,
                 model=args.model,
                 base_url=args.base_url,
@@ -198,32 +165,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                 film_type=film_type,
                 film_preset_key=film_preset_key,
                 scene_count=scene_count,
+                auto_plan=bool(args.auto_plan),
                 background=background_text,
                 out_path=out_path,
             )
-            story_content_clean = (story_content or "").replace("**", "")
-            ws.cell(row=row_idx, column=args.write_story_col).value = story_content_clean
             processed += 1
             print(f"Saved CSV: {out_csv}")
             print(f"Story title: {story_title}")
+            print(f"Film type: {decision.film_type}")
+            print(f"Scene count: {decision.scene_count}")
         except Exception as e:
             failed += 1
             print(f"[ERROR] Row {row_idx} failed: {e}", file=sys.stderr)
 
-    xlsx_out = args.xlsx_out or args.xlsx
-    if not args.no_backup and os.path.abspath(xlsx_out) == os.path.abspath(args.xlsx):
-        base, ext = os.path.splitext(args.xlsx)
-        backup_path = f"{base}.bak_{ts}{ext}"
-        try:
-            import shutil
-
-            shutil.copy2(args.xlsx, backup_path)
-            print(f"\nBackup XLSX: {backup_path}")
-        except Exception as e:
-            print(f"\n[WARN] Failed to create backup XLSX: {e}", file=sys.stderr)
-
-    wb.save(xlsx_out)
-    print(f"\nSaved XLSX: {xlsx_out}")
     print(f"Done. ok={processed} failed={failed} out_dir={args.out_dir}")
     return 0 if failed == 0 else 1
 

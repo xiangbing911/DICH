@@ -11,14 +11,13 @@ from openai import OpenAI
 
 
 DEFAULT_SCENE_COUNT = 50
+AUTO_SCENE_COUNT_MIN = 25
+AUTO_SCENE_COUNT_MAX = 35
 DEFAULT_API_KEY_FILE_CANDIDATES = ("dashscope_api_key.txt", "secrets.json")
 
 FILM_TYPE_PRESETS: Dict[str, str] = {
     "documentary": "纪录片",
-    "microfilm": "微电影",
-    "commercial": "广告片",
     "animation": "动画片",
-    "narrative": "叙事短片",
     "poetic": "诗意短片",
     "music": "音乐短片",
 }
@@ -28,21 +27,9 @@ FILM_TYPE_GUIDES: Dict[str, Dict[str, str]] = {
         "story": "类型要求：纪录片宣传短片。语气克制、信息密度高，尽量基于可核验的史实/机构信息，不夸张、不虚构人物经历。",
         "scene": "镜头风格：写实纪实；可包含：环境空镜、手部特写、工序细节、传承人采访式构图、档案/老照片质感、现场声氛围。",
     },
-    "microfilm": {
-        "story": "类型要求：微电影。以一个小人物/小事件切入，三幕式清晰（引子-转折-收束），情绪推进明确，结尾落回非遗价值与传承。",
-        "scene": "镜头风格：电影化叙事；强调：人物动机、情绪层次、关键动作与道具、光影与景别变化。保持画面真实可拍。",
-    },
-    "commercial": {
-        "story": "类型要求：广告片。节奏紧凑、卖点明确（文化价值、工艺独特性、当代意义、参与方式），更强调“记忆点/口号式”段落。",
-        "scene": "镜头风格：高对比、高节奏；可包含：快速蒙太奇、文字信息叠加感（用画面描述）、强记忆点画面、收束到行动号召。",
-    },
     "animation": {
         "story": "类型要求：动画片。允许更具想象力的隐喻与转场，但内容仍需围绕真实非遗信息与工艺逻辑，不要科幻设定喧宾夺主。",
         "scene": "镜头风格：动画化（2D/3D/水墨/剪纸等可选）；强调：形变转场、象征意象、材质笔触、色彩方案与节奏。",
-    },
-    "narrative": {
-        "story": "类型要求：叙事短片。以“人物+选择”为主线，冲突/悬念在中段出现，结尾给出解决与传承的意义回响。",
-        "scene": "镜头风格：叙事优先；强调：时间推进、因果关系、关键节点镜头（建立-冲突-高潮-余韵）。",
     },
     "poetic": {
         "story": "类型要求：诗意短片。语言更凝练、有意象与节奏感；允许留白与象征，但必须让观众理解非遗是什么、为什么重要。",
@@ -55,12 +42,18 @@ FILM_TYPE_GUIDES: Dict[str, Dict[str, str]] = {
 }
 
 
+PROMPT_FACE_REQUIREMENT = "人物要求：所有画面中的人物为中国人（鄂伦春族、鄂温克族、蒙古族）面孔。"
+
+AUTO_FILM_TYPE_LIST = "、".join(FILM_TYPE_PRESETS.values())
+
+
 STORY_TEMPLATE = (
     "你是一名专业的非遗策划与编导。\n"
     "请先搜索整理该非遗主题的官方资料（如：保护单位、级别、分布地区、代表性传承人、核心工艺/流程、历史沿革、现状与保护举措），并用简洁准确的方式介绍该非遗项目。\n"
     "{film_guide}\n"
     "然后撰写一个关于该主题的三分钟{film_type}脚本：聚焦历史文化与当代价值，结构清晰，有明确标题。\n"
-    "约束：不编造不可证实的具体人名/机构/数据；不出现对话台词（如需表达观点用旁白）。"
+    "约束：不编造不可证实的具体人名/机构/数据；不出现对话台词（如需表达观点用旁白）。\n"
+    f"{PROMPT_FACE_REQUIREMENT}"
 )
 
 
@@ -71,9 +64,10 @@ def _build_scenes_template(
     return (
         f"作为一名专业短片导演，请使用以下格式创作{scene_count}个剧本场景：\n"
         f"短片类型：{film_type}\n"
+        f"{PROMPT_FACE_REQUIREMENT}\n"
         f"{extra}"
         "场景：（场景编号）\n"
-        "旁白：{故事中的确切文本}\n"
+        "旁白：{基于故事压缩改写的简化旁白，12-40字}\n"
         f"图像提示：{{以{film_type}的风格描述场景的详细文本到图像提示}}\n"
         f"视频提示:{{以{film_type}的风格描述场景的详细图像生成视频的提示}}\n"
     )
@@ -85,6 +79,12 @@ class Scene:
     image_prompt: str
     video_prompt: str
     voiceover: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PlanDecision:
+    film_type: str
+    scene_count: int
 
 
 def _build_client(api_key: Optional[str], base_url: str) -> OpenAI:
@@ -156,6 +156,46 @@ def _chat_text(
     return (completion.choices[0].message.content or "").strip()
 
 
+def choose_plan(
+    client: OpenAI,
+    *,
+    model: str,
+    topic: str,
+    background: Optional[str],
+    stream: bool,
+) -> PlanDecision:
+    background_text = (background or "").strip()
+    background_block = f"\n项目内容：{background_text}" if background_text else ""
+    prompt = (
+        "你是一名短视频导演与分镜策划。请基于项目名称和项目内容，为三分钟非遗短视频做创作规划。\n"
+        f"仅可从以下类型中选择：{AUTO_FILM_TYPE_LIST}。\n"
+        f"场景数范围：{AUTO_SCENE_COUNT_MIN}-{AUTO_SCENE_COUNT_MAX}。\n"
+        "请严格输出 JSON（不要 Markdown/代码块）：\n"
+        '{\n  "film_type": "纪录片|动画片|诗意短片|音乐短片",\n  "scene_count": 30\n}\n'
+        "要求：scene_count 必须是整数。\n\n"
+        f"项目名称：{topic}{background_block}"
+    )
+    raw = _chat_text(
+        client,
+        model=model,
+        messages=[{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}],
+        stream=stream,
+    )
+    payload = _parse_json_lenient(raw)
+    film_type = str(payload.get("film_type") or "").strip()
+    scene_count_raw = payload.get("scene_count")
+    try:
+        scene_count = int(scene_count_raw)
+    except Exception:
+        scene_count = 30
+
+    if film_type not in FILM_TYPE_PRESETS.values():
+        film_type = FILM_TYPE_PRESETS["documentary"]
+    if scene_count < AUTO_SCENE_COUNT_MIN or scene_count > AUTO_SCENE_COUNT_MAX:
+        scene_count = 30
+    return PlanDecision(film_type=film_type, scene_count=scene_count)
+
+
 def generate_story(
     client: OpenAI,
     *,
@@ -218,25 +258,46 @@ def generate_csv(
     base_url: str,
     api_key: Optional[str],
     stream: bool,
-    film_type: str,
+    film_type: Optional[str],
     film_preset_key: Optional[str],
-    scene_count: int,
+    scene_count: Optional[int],
+    auto_plan: bool,
     background: Optional[str],
     out_path: Optional[str],
-) -> Tuple[str, str, str, List[str]]:
+) -> Tuple[str, str, str, List[str], PlanDecision]:
     film_guide = None
     scene_guide = None
-    if film_preset_key and film_preset_key in FILM_TYPE_GUIDES:
-        film_guide = FILM_TYPE_GUIDES[film_preset_key].get("story")
-        scene_guide = FILM_TYPE_GUIDES[film_preset_key].get("scene")
 
     client = _build_client(api_key, base_url)
+
+    decision = PlanDecision(
+        film_type=(film_type or FILM_TYPE_PRESETS["documentary"]),
+        scene_count=int(scene_count or DEFAULT_SCENE_COUNT),
+    )
+    if auto_plan:
+        decision = choose_plan(
+            client,
+            model=model,
+            topic=topic,
+            background=background,
+            stream=stream,
+        )
+
+    resolved_preset_key = film_preset_key
+    if not resolved_preset_key:
+        for key, label in FILM_TYPE_PRESETS.items():
+            if decision.film_type == label:
+                resolved_preset_key = key
+                break
+    if resolved_preset_key and resolved_preset_key in FILM_TYPE_GUIDES:
+        film_guide = FILM_TYPE_GUIDES[resolved_preset_key].get("story")
+        scene_guide = FILM_TYPE_GUIDES[resolved_preset_key].get("scene")
 
     story = generate_story(
         client,
         model=model,
         topic=topic,
-        film_type=film_type,
+        film_type=decision.film_type,
         film_guide=film_guide,
         background=background,
         stream=stream,
@@ -248,19 +309,19 @@ def generate_csv(
         client,
         model=model,
         story=story,
-        scene_count=scene_count,
-        film_type=film_type,
+        scene_count=decision.scene_count,
+        film_type=decision.film_type,
         scene_guide=scene_guide,
         stream=stream,
     )
-    scenes = scenes_from_payload(payload, expected_count=scene_count)
+    scenes = scenes_from_payload(payload, expected_count=decision.scene_count)
     warnings = validate_voiceovers_are_substrings(story, scenes)
 
     resolved_out_path = out_path or _default_out_path(topic)
     write_csv(resolved_out_path, scenes)
 
     title = extract_story_title(story) or topic
-    return resolved_out_path, title, story, warnings
+    return resolved_out_path, title, story, warnings, decision
 
 
 def generate_scenes_json(
@@ -286,9 +347,10 @@ def generate_scenes_json(
         "  ]\n}\n\n"
         "硬性要求：\n"
         f"1) 必须恰好 {scene_count} 个场景，scene 从 1 到 {scene_count}。\n"
-        "2) voiceover 必须是“故事”中的原文片段（逐字一致），每个场景一个片段。\n"
+        "2) voiceover 为简化旁白：基于故事内容压缩改写，每条建议 12-40 个汉字，清晰易配音。\n"
         f"3) image_prompt / video_prompt 必须是{film_type}风格，细节充分（地点、人物、光线、镜头语言等）。\n"
-        "4) 不要新增任何对话。\n\n"
+        f"4) {PROMPT_FACE_REQUIREMENT}\n"
+        "5) 不要新增任何对话。\n\n"
         f"故事如下：\n{story}"
     )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -361,10 +423,11 @@ def validate_voiceovers_are_substrings(story: str, scenes: List[Scene]) -> List[
         if not s.voiceover:
             warnings.append(f"Scene {s.scene_number}: voiceover missing.")
             continue
-        if s.voiceover not in story:
-            warnings.append(
-                f"Scene {s.scene_number}: voiceover is not an exact substring of story."
-            )
+        text_len = len(s.voiceover.strip())
+        if text_len < 8:
+            warnings.append(f"Scene {s.scene_number}: voiceover too short.")
+        if text_len > 60:
+            warnings.append(f"Scene {s.scene_number}: voiceover too long.")
     return warnings
 
 
@@ -397,13 +460,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument(
         "--film-type-custom",
         default=None,
-        help="自定义短片类型（覆盖 --film-type），例如：'国风动画短片'、'公益广告片'",
+        help="自定义短片类型（覆盖 --film-type），例如：'国风动画短片'、'公益宣传片'",
     )
     p.add_argument(
         "--scene-count",
         type=int,
-        default=DEFAULT_SCENE_COUNT,
-        help=f"场景数量（默认 {DEFAULT_SCENE_COUNT}）",
+        default=None,
+        help=f"场景数量（可选；未指定且开启自动规划时由模型决定）",
     )
     p.add_argument(
         "--background",
@@ -436,6 +499,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--out",
         help="输出 CSV 路径（默认 outputs/<topic>_<timestamp>.csv）",
     )
+    p.add_argument(
+        "--auto-plan",
+        action="store_true",
+        default=True,
+        help="由模型自动决定短片类型与场景数量（默认开启）",
+    )
+    p.add_argument(
+        "--no-auto-plan",
+        action="store_false",
+        dest="auto_plan",
+        help="关闭自动规划，按参数或默认值生成",
+    )
     args = p.parse_args(argv)
 
     topic = args.topic
@@ -445,46 +520,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Empty topic.", file=sys.stderr)
         return 2
 
-    film_type: str
+    film_type: Optional[str] = None
     film_preset_key: Optional[str] = None
     custom_type = str(args.film_type_custom or "").strip()
-    if custom_type:
+    if custom_type and not args.auto_plan:
         film_type, film_preset_key = resolve_film_type(
             film_type_preset=None, film_type_custom=custom_type
         )
-    elif args.film_type:
+    elif args.film_type and not args.auto_plan:
         film_type, film_preset_key = resolve_film_type(
             film_type_preset=args.film_type, film_type_custom=None
         )
-    else:
-        if not sys.stdin.isatty():
-            film_type, film_preset_key = resolve_film_type(
-                film_type_preset="documentary", film_type_custom=None
-            )
-        else:
-            print("\n请选择短片类型（回车默认：纪录片）：")
-            options = list(FILM_TYPE_PRESETS.items())
-            for i, (k, label) in enumerate(options, start=1):
-                print(f"{i}) {label}  (--film-type {k})")
-            raw = input("输入序号：").strip()
-            if raw:
-                try:
-                    idx = int(raw)
-                    chosen_key, chosen_label = options[idx - 1]
-                    film_type, film_preset_key = resolve_film_type(
-                        film_type_preset=chosen_key, film_type_custom=None
-                    )
-                except Exception:
-                    film_type, film_preset_key = resolve_film_type(
-                        film_type_preset="documentary", film_type_custom=None
-                    )
-            else:
-                film_type, film_preset_key = resolve_film_type(
-                    film_type_preset="documentary", film_type_custom=None
-                )
+    elif not args.auto_plan:
+        film_type, film_preset_key = resolve_film_type(
+            film_type_preset="documentary", film_type_custom=None
+        )
 
-    scene_count = int(args.scene_count)
-    if scene_count <= 0:
+    scene_count: Optional[int] = args.scene_count
+    if scene_count is not None and scene_count <= 0:
         print("--scene-count must be > 0", file=sys.stderr)
         return 2
 
@@ -502,7 +555,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         print("\n=== 生成中 ===")
-        out_path, story_title, _story, warnings = generate_csv(
+        out_path, story_title, _story, warnings, decision = generate_csv(
             topic=topic,
             model=args.model,
             base_url=args.base_url,
@@ -511,6 +564,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             film_type=film_type,
             film_preset_key=film_preset_key,
             scene_count=scene_count,
+            auto_plan=bool(args.auto_plan),
             background=background,
             out_path=args.out,
         )
@@ -524,6 +578,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"- {w}")
 
     print(f"\nStory title: {story_title}")
+    print(f"Film type: {decision.film_type}")
+    print(f"Scene count: {decision.scene_count}")
     print(f"Saved CSV: {out_path}")
     return 0
 
